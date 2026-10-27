@@ -2,7 +2,8 @@ project('openh264', ['c', 'cpp'],
   version : '2.4.1',
   meson_version : '>= 0.52',
   default_options : [ 'warning_level=1',
-                      'buildtype=debugoptimized' ])
+                      'buildtype=debugoptimized',
+                      'b_ndebug=if-release' ])
 
 major_version = '7'
 
@@ -106,11 +107,13 @@ if ['linux', 'android', 'ios', 'darwin'].contains(system)
 elif system == 'windows'
   if cpu_family == 'x86'
     asm_format = 'win32'
-    asm_args += ['-DPREFIX', '-DX86_32']
+    asm_args += ['-DPREFIX', '-DX86_32', '-DHAVE_AVX2']
+    add_project_arguments('-DHAVE_AVX2', '-DX86_ASM', '-DX86_32_ASM', language: ['c', 'cpp'])
     asm_inc = join_paths(meson.current_source_dir(), 'codec', 'common', 'x86', '')
   elif cpu_family == 'x86_64'
     asm_format = 'win64'
-    asm_args += ['-DWIN64']
+    asm_args += ['-DWIN64', '-DHAVE_AVX2']
+    add_project_arguments('-DHAVE_AVX2', '-DX86_ASM', language: ['c', 'cpp'])
     asm_inc = join_paths(meson.current_source_dir(), 'codec', 'common', 'x86', '')
   elif cpu_family == 'arm'
     if cpp.get_argument_syntax() == 'msvc'

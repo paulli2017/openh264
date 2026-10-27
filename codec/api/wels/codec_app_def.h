@@ -142,7 +142,20 @@ typedef enum {
 
   ENCODER_OPTION_IS_LOSSLESS_LINK,            ///< advanced algorithmetic settings
 
-  ENCODER_OPTION_BITS_VARY_PERCENTAGE        ///< bit vary percentage
+  ENCODER_OPTION_BITS_VARY_PERCENTAGE,       ///< bit vary percentage
+
+  /**
+   * Experimental luma-only alpha encoder option (int: 0 = off, 1 = on), disabled by default.
+   * When on, the encoder does no chroma work: chroma intra mode search, residual
+   * transform/quantization/reconstruction, motion compensation, deblocking, reference
+   * padding and chroma skip SADs are all bypassed; chroma is coded as zero residual.
+   * Set after initialization and before the first EncodeFrame. The caller
+   * guarantees that all input U/V samples are 128, with valid I420 pointers.
+   * Supports one spatial layer, even dimensions and no denoising.
+   * Retains standard 4:2:0 output. Reinitialize to change mode after encoding
+   * or to change parameter sets/LTR configuration while this mode is enabled.
+   */
+  ENCODER_OPTION_NEUTRAL_CHROMA = 0x10000
 } ENCODER_OPTION;
 
 /**

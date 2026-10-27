@@ -2,6 +2,82 @@ OpenH264
 ========
 OpenH264 is a codec library which supports H.264 encoding and decoding. It is suitable for use in real time applications such as WebRTC. See http://www.openh264.org/ for more details.
 
+Experimental alpha encoder
+-------------------------
+This branch adds `ENCODER_OPTION_NEUTRAL_CHROMA` (`0x10000`, pointer to an `int`
+containing 0 or 1). It is disabled by default. Enable it after `InitializeExt`
+and after any LTR setup, before the first `EncodeFrame`.
+
+The caller guarantees that every input U/V sample is 128. Supply valid I420
+planes/strides; null chroma pointers are not supported. This initial version
+requires one spatial layer, even fixed dimensions, and denoising disabled.
+Reinitialize to change mode after encoding or to update parameter sets/LTR
+configuration while the mode is enabled. Unsupported settings return an error.
+No public parameter-structure layout or existing export changes are required.
+
+When enabled (luma-only mode), the encoder does no chroma processing: chroma
+intra mode search, residual transform/quantization/reconstruction, chroma motion
+compensation, chroma deblocking, chroma reference padding and chroma skip SADs
+are all bypassed. Because input and reconstructed chroma are always 128, each
+bypassed step is an identity, so the output is unchanged. The bitstream is still
+standard 4:2:0 with zero chroma residual (not 4:0:0) and decodes with an
+unmodified decoder; decoded luma matches mode-off encoding and chroma is 128.
+
+Windows x64 builds use Meson with MSVC and NASM on PATH. This branch corrects
+the v2.4.1 Windows x86/x64 Meson flags: `X86_ASM` and `HAVE_AVX2` must be
+defined for both C and C++, and `HAVE_AVX2` for NASM (`X86_32_ASM` also applies
+to x86). Assembling the routines alone does not enable CPU detection/dispatch.
+The existing runtime checks select supported instructions; generic C++ code
+does not require a global `/arch:AVX2` flag.
+Release builds also use `b_ndebug=if-release`, matching the upstream Makefile's
+`-DNDEBUG` behavior. Debug/debugoptimized builds retain assertions. For an
+already configured Release build, run `meson configure build-alpha -Db_ndebug=if-release`.
+
+```powershell
+meson setup build-alpha --buildtype=release -Dtests=enabled
+meson compile -C build-alpha -j 8
+.\build-alpha\test\api\test_api.exe --gtest_filter=Alpha/NeutralChromaTest.*
+```
+
+Keep an unmodified codec checkout from tag `v2.4.1` in a separate worktree.
+Apply the same Meson flag correction to that control; do not apply the neutral
+chroma changes. Build both with identical compiler/build settings.
+
+`test\neutral_chroma_benchmark.cpp` is a Windows dynamic-DLL benchmark and
+cross-decoder regression check. From an x64 Visual Studio developer shell:
+
+```powershell
+New-Item -ItemType Directory -Path artifacts -Force
+cl /nologo /O2 /EHsc /std:c++17 /Icodec\api test\neutral_chroma_benchmark.cpp /Foartifacts\neutral_chroma_benchmark.obj /Feartifacts\neutral_chroma_benchmark.exe
+.\artifacts\neutral_chroma_benchmark.exe <baseline.dll> <experimental.dll> <stock.dll> 1280 720 90
+```
+
+The original invocation compares source baseline, experimental mode off, and
+experimental mode on over three synthetic-input runs, retaining the original
+CSV columns. The benchmark now explicitly matches AlphaExamples' QP32, GOP60,
+MEDIUM complexity, background detection, single-thread/single-slice defaults.
+Adaptive quantization is requested but OpenH264 disables it in constant-QP
+`RC_OFF_MODE`; the effective parameters are checked for every encoder. Earlier
+synthetic measurements used the library's default complexity and are superseded.
+
+For a real sequence, append a tightly packed, headerless R8 file and optionally
+a repetition count. The requested number of frames is preloaded before timing:
+
+```powershell
+.\artifacts\neutral_chroma_benchmark.exe <baseline.dll> <experimental.dll> <stock.dll> 2560 1440 274 <raw-r8-file> 8
+```
+
+Raw mode adds stock encoding to the three controls, pins only the benchmark
+thread to the first allowed logical CPU, and reports mean/p50/p95/p99 call time
+and calling-thread CPU cycles. Each variant has independent encoder/reference
+state. Execution order rotates each frame and repetition, and the first five
+frames are excluded from timing. NAL copying, stock decoding, validation and
+file I/O are outside the measured calls. Decoded Y is compared byte-for-byte
+on every frame, decoded U/V must be 128, and every variant's encoded frame size
+must match. Only current decoded frames are retained; full input is preloaded.
+CPU-cycle results apply to the checked single-thread configuration, not to
+total worker-thread CPU usage.
+
 Encoder Features
 ----------------
 - Constrained Baseline Profile up to Level 5.2 (Max frame size is 36864 macro-blocks)

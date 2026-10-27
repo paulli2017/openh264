@@ -2,6 +2,7 @@
 #include "utils/HashFunctions.h"
 #include "BaseEncoderTest.h"
 #include <string>
+#include <vector>
 
 static void UpdateHashFromFrame (const SFrameBSInfo& info, SHA1Context* ctx) {
   for (int i = 0; i < info.iLayerNum; ++i) {
@@ -181,3 +182,201 @@ static const EncodeFileParam kFileParamArray[] = {
 
 INSTANTIATE_TEST_CASE_P (EncodeFile, EncoderOutputTest,
                          ::testing::ValuesIn (kFileParamArray));
+
+struct NeutralChromaParam {
+  int width;
+  int height;
+  unsigned short threads;
+  EUsageType usage;
+  bool bitrate;
+  bool ltr;
+};
+
+class NeutralChromaTest : public ::testing::TestWithParam<NeutralChromaParam> {
+ protected:
+  ISVCEncoder* encoders_[2];
+  ISVCDecoder* decoders_[2];
+
+  virtual void SetUp() {
+    memset (encoders_, 0, sizeof (encoders_));
+    memset (decoders_, 0, sizeof (decoders_));
+    for (int i = 0; i < 2; ++i) {
+      ASSERT_EQ (0, WelsCreateSVCEncoder (&encoders_[i]));
+      ASSERT_EQ (0, WelsCreateDecoder (&decoders_[i]));
+      SDecodingParam decoding = {};
+      decoding.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_AVC;
+      decoding.eEcActiveIdc = ERROR_CON_DISABLE;
+      ASSERT_EQ (0, decoders_[i]->Initialize (&decoding));
+    }
+  }
+
+  virtual void TearDown() {
+    for (int i = 0; i < 2; ++i) {
+      if (encoders_[i]) {
+        encoders_[i]->Uninitialize();
+        WelsDestroySVCEncoder (encoders_[i]);
+      }
+      if (decoders_[i]) {
+        decoders_[i]->Uninitialize();
+        WelsDestroyDecoder (decoders_[i]);
+      }
+    }
+  }
+
+  void InitializeEncoders (int mode0 = 0, int mode1 = 1) {
+    const NeutralChromaParam p = GetParam();
+    for (int i = 0; i < 2; ++i) {
+      SEncParamExt param = {};
+      ASSERT_EQ (0, encoders_[i]->GetDefaultParams (&param));
+      param.iUsageType = p.usage;
+      param.iPicWidth = p.width;
+      param.iPicHeight = p.height;
+      param.iTargetBitrate = 500000;
+      param.iRCMode = p.bitrate ? RC_BITRATE_MODE : RC_OFF_MODE;
+      param.fMaxFrameRate = 30;
+      param.iTemporalLayerNum = 1;
+      param.iSpatialLayerNum = 1;
+      param.uiIntraPeriod = 8;
+      param.iMultipleThreadIdc = p.threads;
+      param.bUseLoadBalancing = false; // Timing-dependent slice boundaries prevent exact A/B comparisons.
+      param.bEnableFrameSkip = false;
+      param.bEnableSceneChangeDetect = false;
+      param.bEnableDenoise = false;
+      param.bEnableLongTermReference = p.ltr;
+      param.iLTRRefNum = p.ltr ? 2 : 0;
+      param.iLtrMarkPeriod = 4;
+      SSpatialLayerConfig& layer = param.sSpatialLayers[0];
+      layer.iVideoWidth = p.width;
+      layer.iVideoHeight = p.height;
+      layer.fFrameRate = 30;
+      layer.iSpatialBitrate = 500000;
+      layer.iMaxSpatialBitrate = 500000;
+      layer.iDLayerQp = 32;
+      layer.uiProfileIdc = PRO_BASELINE;
+      layer.sSliceArgument.uiSliceMode = p.threads == 1 ? SM_SINGLE_SLICE : SM_FIXEDSLCNUM_SLICE;
+      layer.sSliceArgument.uiSliceNum = p.threads;
+      ASSERT_EQ (0, encoders_[i]->InitializeExt (&param));
+    }
+    const int modes[2] = { mode0, mode1 };
+    for (int i = 0; i < 2; ++i) {
+      int mode = modes[i];
+      if (mode)
+        ASSERT_EQ (0, encoders_[i]->SetOption (ENCODER_OPTION_NEUTRAL_CHROMA, &mode));
+    }
+  }
+};
+
+TEST_P (NeutralChromaTest, PreservesDecodedAlphaAndNeutralReferences) {
+  InitializeEncoders();
+  ASSERT_FALSE (HasFatalFailure());
+  const NeutralChromaParam p = GetParam();
+  const int ySize = p.width * p.height;
+  std::vector<unsigned char> pixels (ySize * 3 / 2, 128);
+  SSourcePicture picture = {};
+  picture.iColorFormat = videoFormatI420;
+  picture.iPicWidth = p.width;
+  picture.iPicHeight = p.height;
+  picture.iStride[0] = p.width;
+  picture.iStride[1] = picture.iStride[2] = p.width / 2;
+  picture.pData[0] = &pixels[0];
+  picture.pData[1] = &pixels[ySize];
+  picture.pData[2] = &pixels[ySize + ySize / 4];
+
+  for (int frame = 0; frame < 24; ++frame) {
+    SCOPED_TRACE (frame);
+    for (int y = 0; y < p.height; ++y) {
+      for (int x = 0; x < p.width; ++x) {
+        const int pattern = (frame / 2) % 6;
+        pixels[y * p.width + x] = pattern == 0 ? 0 : pattern == 1 ? 255 :
+                                 pattern == 2 ? (x * 255 / p.width) :
+                                 pattern == 3 ? (((x / 4 + y / 4) & 1) * 255) :
+                                 pattern == 4 ? ((x + frame * 3) % p.width < p.width / 2 ? 255 : 0) :
+                                 ((x * 37 + y * 13 + frame * 17) & 255);
+      }
+    }
+    picture.uiTimeStamp = frame * 33;
+    unsigned char* decoded[2][3] = {};
+    SBufferInfo buffers[2] = {};
+    for (int i = 0; i < 2; ++i) {
+      if (frame == 13)
+        ASSERT_EQ (0, encoders_[i]->ForceIntraFrame (true));
+      SFrameBSInfo info = {};
+      ASSERT_EQ (0, encoders_[i]->EncodeFrame (&picture, &info));
+      ASSERT_NE (videoFrameTypeSkip, info.eFrameType);
+      std::vector<unsigned char> packet;
+      for (int layer = 0; layer < info.iLayerNum; ++layer) {
+        const SLayerBSInfo& bs = info.sLayerInfo[layer];
+        int length = 0;
+        for (int nal = 0; nal < bs.iNalCount; ++nal)
+          length += bs.pNalLengthInByte[nal];
+        packet.insert (packet.end(), bs.pBsBuf, bs.pBsBuf + length);
+      }
+      ASSERT_FALSE (packet.empty());
+      ASSERT_EQ (dsErrorFree, decoders_[i]->DecodeFrameNoDelay (&packet[0], static_cast<int> (packet.size()),
+                 decoded[i], &buffers[i]));
+      ASSERT_EQ (1, buffers[i].iBufferStatus);
+      ASSERT_EQ (p.width, buffers[i].UsrData.sSystemBuffer.iWidth);
+      ASSERT_EQ (p.height, buffers[i].UsrData.sSystemBuffer.iHeight);
+    }
+    for (int y = 0; y < p.height; ++y) {
+      ASSERT_EQ (0, memcmp (decoded[0][0] + y * buffers[0].UsrData.sSystemBuffer.iStride[0],
+                           decoded[1][0] + y * buffers[1].UsrData.sSystemBuffer.iStride[0], p.width));
+    }
+    for (int i = 0; i < 2; ++i) {
+      for (int plane = 1; plane < 3; ++plane) {
+        for (int y = 0; y < p.height / 2; ++y) {
+          for (int x = 0; x < p.width / 2; ++x) {
+            ASSERT_EQ (128, decoded[i][plane][y * buffers[i].UsrData.sSystemBuffer.iStride[1] + x]);
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST_P (NeutralChromaTest, RejectsModeChangesWithExistingReferencesAndUnsafeReconfiguration) {
+  InitializeEncoders();
+  ASSERT_FALSE (HasFatalFailure());
+  const NeutralChromaParam p = GetParam();
+  std::vector<unsigned char> pixels (p.width * p.height * 3 / 2, 128);
+  SSourcePicture picture = {};
+  picture.iColorFormat = videoFormatI420;
+  picture.iPicWidth = p.width;
+  picture.iPicHeight = p.height;
+  picture.iStride[0] = p.width;
+  picture.iStride[1] = picture.iStride[2] = p.width / 2;
+  picture.pData[0] = &pixels[0];
+  picture.pData[1] = &pixels[p.width * p.height];
+  picture.pData[2] = picture.pData[1] + p.width * p.height / 4;
+  for (int i = 0; i < 2; ++i) {
+    SFrameBSInfo info = {};
+    ASSERT_EQ (0, encoders_[i]->EncodeFrame (&picture, &info));
+    int changed = i == 0 ? 1 : 0;
+    EXPECT_EQ (cmInitParaError, encoders_[i]->SetOption (ENCODER_OPTION_NEUTRAL_CHROMA, &changed));
+  }
+  SEncParamExt param = {};
+  ASSERT_EQ (0, encoders_[1]->GetOption (ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, &param));
+  EXPECT_EQ (cmUnsupportedData, encoders_[1]->SetOption (ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, &param));
+  picture.pData[1] = NULL;
+  SFrameBSInfo info = {};
+  EXPECT_EQ (cmInitParaError, encoders_[1]->EncodeFrame (&picture, &info));
+  ASSERT_EQ (0, encoders_[1]->Uninitialize());
+  ASSERT_EQ (0, encoders_[1]->InitializeExt (&param));
+  int enabled = -1;
+  ASSERT_EQ (0, encoders_[1]->GetOption (ENCODER_OPTION_NEUTRAL_CHROMA, &enabled));
+  EXPECT_EQ (0, enabled);
+  enabled = 2;
+  EXPECT_EQ (cmInitParaError, encoders_[1]->SetOption (ENCODER_OPTION_NEUTRAL_CHROMA, &enabled));
+}
+
+static const NeutralChromaParam kNeutralChromaParams[] = {
+  { 16, 16, 1, CAMERA_VIDEO_REAL_TIME, false, false },
+  { 34, 50, 1, CAMERA_VIDEO_REAL_TIME, false, false },
+  { 128, 96, 1, CAMERA_VIDEO_REAL_TIME, false, true },
+  { 320, 180, 2, CAMERA_VIDEO_REAL_TIME, false, false },
+  { 320, 180, 1, CAMERA_VIDEO_REAL_TIME, true, true },
+  { 128, 96, 1, SCREEN_CONTENT_REAL_TIME, false, false },
+  { 320, 180, 2, SCREEN_CONTENT_REAL_TIME, true, false }
+};
+
+INSTANTIATE_TEST_CASE_P (Alpha, NeutralChromaTest, ::testing::ValuesIn (kNeutralChromaParams));

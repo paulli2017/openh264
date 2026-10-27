@@ -452,6 +452,14 @@ void WelsInterMbEncode (sWelsEncCtx* pEncCtx, SSlice* pSlice, SMB* pCurMb) {
 
 //only BaseLayer inter MB and SpatialLayer (uiQualityId = 0) inter MB calling this pFunc.
 //only for I SSlice
+static void ClearNeutralChromaResidual (SMB* pCurMb, SMbCache* pMbCache, int16_t* pResidual) {
+  pCurMb->uiCbp &= 0x0f;
+  memset (pCurMb->pNonZeroCount + 16, 0, 8);
+  memset (pMbCache->pDct->iChromaDc, 0, sizeof (pMbCache->pDct->iChromaDc));
+  memset (pMbCache->pDct->iChromaBlock, 0, sizeof (pMbCache->pDct->iChromaBlock));
+  memset (pResidual, 0, 128 * sizeof (int16_t));
+}
+
 void WelsIMbChromaEncode (sWelsEncCtx* pEncCtx, SMB* pCurMb, SMbCache* pMbCache) {
   SWelsFuncPtrList* pFunc       = pEncCtx->pFuncList;
   SDqLayer* pCurLayer           = pEncCtx->pCurDqLayer;
@@ -461,6 +469,13 @@ void WelsIMbChromaEncode (sWelsEncCtx* pEncCtx, SMB* pCurMb, SMbCache* pMbCache)
   uint8_t* pBestPred            = pMbCache->pBestPredIntraChroma;
   uint8_t* pCsCb                = pMbCache->SPicData.pCsMb[1];
   uint8_t* pCsCr                = pMbCache->SPicData.pCsMb[2];
+
+  if (pEncCtx->bNeutralChroma) {
+    ClearNeutralChromaResidual (pCurMb, pMbCache, pCurRS);
+    pFunc->pfCopy8x8Aligned (pCsCb, kiCsStride, pBestPred, 8);
+    pFunc->pfCopy8x8Aligned (pCsCr, kiCsStride, pBestPred + 64, 8);
+    return;
+  }
 
   //cb
   pFunc->pfDctFourT4 (pCurRS,    pMbCache->SPicData.pEncMb[1], kiEncStride, pBestPred,    8);
@@ -484,6 +499,11 @@ void WelsPMbChromaEncode (sWelsEncCtx* pEncCtx, SSlice* pSlice, SMB* pCurMb) {
   int16_t* pCurRS               = pMbCache->pCoeffLevel + 256;
   uint8_t* pBestPred            = pMbCache->pMemPredChroma;
 
+  if (pEncCtx->bNeutralChroma) {
+    ClearNeutralChromaResidual (pCurMb, pMbCache, pCurRS);
+    return;
+  }
+
   pFunc->pfDctFourT4 (pCurRS,       pMbCache->SPicData.pEncMb[1],   kiEncStride,    pBestPred,      8);
   pFunc->pfDctFourT4 (pCurRS + 64,  pMbCache->SPicData.pEncMb[2],   kiEncStride,    pBestPred + 64, 8);
 
@@ -504,8 +524,10 @@ void OutputPMbWithoutConstructCsRsNoCopy (sWelsEncCtx* pCtx, SDqLayer* pDq, SSli
     PIDctFunc pfIdctFour4x4             = pCtx->pFuncList->pfIDctFourT4;
 
     WelsIDctT4RecOnMb (pDecY, kiDecStrideLuma, pDecY, kiDecStrideLuma, pScaledTcoeff,  pfIdctFour4x4);
-    pfIdctFour4x4 (pDecU, kiDecStrideChroma, pDecU, kiDecStrideChroma, pScaledTcoeff + 256);
-    pfIdctFour4x4 (pDecV, kiDecStrideChroma, pDecV, kiDecStrideChroma, pScaledTcoeff + 320);
+    if (!pCtx->bNeutralChroma) {
+      pfIdctFour4x4 (pDecU, kiDecStrideChroma, pDecU, kiDecStrideChroma, pScaledTcoeff + 256);
+      pfIdctFour4x4 (pDecV, kiDecStrideChroma, pDecV, kiDecStrideChroma, pScaledTcoeff + 320);
+    }
   }
 }
 

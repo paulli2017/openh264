@@ -117,6 +117,11 @@ typedef struct TagWelsEncCtx {
   SLogContext sLogCtx;
 // Input
   SWelsSvcCodingParam* pSvcParam;   // SVC parameter, WelsSVCParamConfig in svc_param_settings.h
+  bool              bNeutralChroma; // luma-only: all chroma prediction/residual/MC/deblocking/padding work bypassed
+  bool              bFrameEncodingStarted;
+  SMcFunc           sNeutralSavedMcFuncs;
+  DeblockingFunc    sNeutralSavedDeblocking;
+  SExpandPicFunc    sNeutralSavedExpandPic;
 
   int32_t*          pSadCostMb;
   /* MVD cost tables for Inter MB */

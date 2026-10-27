@@ -56,6 +56,57 @@
 
 namespace WelsEnc {
 
+// With all chroma input and reconstruction fixed at 128, chroma MC always yields 128 and
+// deblocking/padding of a constant plane are identities, so these can be bypassed.
+// Chroma MC blocks are 8, 4 or 2 wide; fixed-size stores avoid a memset call per row.
+static void McChromaNeutral (const uint8_t*, int32_t, uint8_t* pDst, int32_t iDstStride, int16_t, int16_t,
+                             int32_t iWidth, int32_t iHeight) {
+  static const uint8_t k128[8] = { 128, 128, 128, 128, 128, 128, 128, 128 };
+  if (iWidth == 8) {
+    for (int32_t i = 0; i < iHeight; i++, pDst += iDstStride)
+      memcpy (pDst, k128, 8);
+  } else if (iWidth == 4) {
+    for (int32_t i = 0; i < iHeight; i++, pDst += iDstStride)
+      memcpy (pDst, k128, 4);
+  } else if (iWidth == 2) {
+    for (int32_t i = 0; i < iHeight; i++, pDst += iDstStride)
+      memcpy (pDst, k128, 2);
+  } else {
+    for (int32_t i = 0; i < iHeight; i++, pDst += iDstStride)
+      memset (pDst, 128, iWidth);
+  }
+}
+static void ChromaDeblockingLT4Nop (uint8_t*, uint8_t*, int32_t, int32_t, int32_t, int8_t*) {}
+static void ChromaDeblockingEQ4Nop (uint8_t*, uint8_t*, int32_t, int32_t, int32_t) {}
+static void ExpandChromaNop (uint8_t*, const int32_t, const int32_t, const int32_t) {}
+
+static void SetNeutralChroma (sWelsEncCtx* pCtx, bool bEnable) {
+  if (bEnable == pCtx->bNeutralChroma)
+    return;
+  SWelsFuncPtrList* pFunc = pCtx->pFuncList;
+  if (bEnable) {
+    pCtx->sNeutralSavedMcFuncs    = pFunc->sMcFuncs;
+    pCtx->sNeutralSavedDeblocking = pFunc->pfDeblocking;
+    pCtx->sNeutralSavedExpandPic  = pFunc->sExpandPicFunc;
+    pFunc->sMcFuncs.pMcChromaFunc                = McChromaNeutral;
+    pFunc->pfDeblocking.pfChromaDeblockingLT4Ver = ChromaDeblockingLT4Nop;
+    pFunc->pfDeblocking.pfChromaDeblockingLT4Hor = ChromaDeblockingLT4Nop;
+    pFunc->pfDeblocking.pfChromaDeblockingEQ4Ver = ChromaDeblockingEQ4Nop;
+    pFunc->pfDeblocking.pfChromaDeblockingEQ4Hor = ChromaDeblockingEQ4Nop;
+    pFunc->sExpandPicFunc.pfExpandChromaPicture[0] = ExpandChromaNop;
+    pFunc->sExpandPicFunc.pfExpandChromaPicture[1] = ExpandChromaNop;
+  } else {
+    pFunc->sMcFuncs.pMcChromaFunc = pCtx->sNeutralSavedMcFuncs.pMcChromaFunc;
+    pFunc->pfDeblocking.pfChromaDeblockingLT4Ver = pCtx->sNeutralSavedDeblocking.pfChromaDeblockingLT4Ver;
+    pFunc->pfDeblocking.pfChromaDeblockingLT4Hor = pCtx->sNeutralSavedDeblocking.pfChromaDeblockingLT4Hor;
+    pFunc->pfDeblocking.pfChromaDeblockingEQ4Ver = pCtx->sNeutralSavedDeblocking.pfChromaDeblockingEQ4Ver;
+    pFunc->pfDeblocking.pfChromaDeblockingEQ4Hor = pCtx->sNeutralSavedDeblocking.pfChromaDeblockingEQ4Hor;
+    pFunc->sExpandPicFunc.pfExpandChromaPicture[0] = pCtx->sNeutralSavedExpandPic.pfExpandChromaPicture[0];
+    pFunc->sExpandPicFunc.pfExpandChromaPicture[1] = pCtx->sNeutralSavedExpandPic.pfExpandChromaPicture[1];
+  }
+  pCtx->bNeutralChroma = bEnable;
+}
+
 /*
  *  CWelsH264SVCEncoder class implementation
  */
@@ -383,6 +434,18 @@ int CWelsH264SVCEncoder::EncodeFrame (const SSourcePicture* kpSrcPic, SFrameBSIn
     return cmInitParaError;
   }
 
+  if (m_pEncContext->bNeutralChroma &&
+      ((kpSrcPic->iPicWidth & 1) || (kpSrcPic->iPicHeight & 1) ||
+       kpSrcPic->iPicWidth != m_iMaxPicWidth || kpSrcPic->iPicHeight != m_iMaxPicHeight ||
+       !kpSrcPic->pData[0] || !kpSrcPic->pData[1] || !kpSrcPic->pData[2] ||
+       kpSrcPic->iStride[0] < kpSrcPic->iPicWidth ||
+       kpSrcPic->iStride[1] < kpSrcPic->iPicWidth / 2 ||
+       kpSrcPic->iStride[2] < kpSrcPic->iPicWidth / 2)) {
+    WelsLog (&m_pWelsTrace->m_sLogCtx, WELS_LOG_ERROR, "Neutral chroma requires a valid, fixed-size I420 picture.");
+    return cmInitParaError;
+  }
+  m_pEncContext->bFrameEncodingStarted = true;
+
   const int32_t kiEncoderReturn = EncodeFrameInternal (kpSrcPic, pBsInfo);
 
   if (kiEncoderReturn != cmResultSuccess) {
@@ -695,7 +758,29 @@ int CWelsH264SVCEncoder::SetOption (ENCODER_OPTION eOptionId, void* pOption) {
     return cmInitExpected;
   }
 
+  if (m_pEncContext && m_pEncContext->bNeutralChroma &&
+      (eOptionId == ENCODER_OPTION_SVC_ENCODE_PARAM_BASE ||
+       eOptionId == ENCODER_OPTION_SVC_ENCODE_PARAM_EXT ||
+       eOptionId == ENCODER_OPTION_SPS_PPS_ID_STRATEGY || eOptionId == ENCODER_OPTION_LTR)) {
+    WelsLog (&m_pWelsTrace->m_sLogCtx, WELS_LOG_ERROR, "Reinitialize to reconfigure a neutral-chroma encoder.");
+    return cmUnsupportedData;
+  }
+
   switch (eOptionId) {
+  case ENCODER_OPTION_NEUTRAL_CHROMA: {
+    const int32_t iValue = * (static_cast<int32_t*> (pOption));
+    if ((iValue != 0 && iValue != 1) ||
+        (m_pEncContext->bFrameEncodingStarted && ((iValue != 0) != m_pEncContext->bNeutralChroma)) ||
+        (iValue && (m_pEncContext->pSvcParam->iSpatialLayerNum != 1 ||
+                    m_pEncContext->pSvcParam->bEnableDenoise ||
+                    (m_iMaxPicWidth & 1) || (m_iMaxPicHeight & 1)))) {
+      WelsLog (&m_pWelsTrace->m_sLogCtx, WELS_LOG_ERROR,
+               "Neutral chroma must be configured before encoding, with one even-sized spatial layer and no denoising.");
+      return cmInitParaError;
+    }
+    SetNeutralChroma (m_pEncContext, iValue != 0);
+  }
+  break;
   case ENCODER_OPTION_INTER_SPATIAL_PRED: { // Inter spatial layer prediction flag
     WelsLog (&m_pWelsTrace->m_sLogCtx, WELS_LOG_INFO,
              "ENCODER_OPTION_INTER_SPATIAL_PRED, this feature not supported at present.");
@@ -1202,6 +1287,9 @@ int CWelsH264SVCEncoder::GetOption (ENCODER_OPTION eOptionId, void* pOption) {
   }
 
   switch (eOptionId) {
+  case ENCODER_OPTION_NEUTRAL_CHROMA:
+    * (static_cast<int32_t*> (pOption)) = m_pEncContext->bNeutralChroma ? 1 : 0;
+    break;
   case ENCODER_OPTION_INTER_SPATIAL_PRED: { // Inter spatial layer prediction flag
     WelsLog (&m_pWelsTrace->m_sLogCtx, WELS_LOG_INFO,
              "ENCODER_OPTION_INTER_SPATIAL_PRED, this feature not supported at present.");

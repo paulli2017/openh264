@@ -864,7 +864,16 @@ int32_t WelsMdI4x4Fast (sWelsEncCtx* pEncCtx, SWelsMD* pWelsMd, SMB* pCurMb, SMb
   return iCosti4x4;
 }
 
-int32_t WelsMdIntraChroma (SWelsFuncPtrList* pFunc, SDqLayer* pCurDqLayer, SMbCache* pMbCache, int32_t iLambda) {
+int32_t WelsMdIntraChroma (SWelsFuncPtrList* pFunc, SDqLayer* pCurDqLayer, SMbCache* pMbCache, int32_t iLambda,
+                         bool bNeutralChroma) {
+  if (bNeutralChroma) {
+    const int32_t iNeighbor = pMbCache->uiNeighborIntra & 0x03;
+    const int8_t kDcModes[4] = { C_PRED_DC_128, C_PRED_DC_L, C_PRED_DC_T, C_PRED_DC };
+    pMbCache->uiChmaI8x8Mode = kDcModes[iNeighbor];
+    pMbCache->pBestPredIntraChroma = pMbCache->pMemPredChroma;
+    memset (pMbCache->pBestPredIntraChroma, 128, 128);
+    return iLambda; // Zero distortion plus the one-bit DC mode.
+  }
   const int8_t* kpAvailMode;
   int32_t iAvailCount = 0;
   int32_t iChmaIdx = 0;
@@ -1469,15 +1478,19 @@ bool WelsMdPSkipEnc (sWelsEncCtx* pEncCtx, SWelsMD* pWelsMd, SMB* pCurMb, SMbCac
                     pCurLayer->iEncStride[0], pDstLuma, 16);
 
   const int32_t iStrideUV = (sQpelMvp.iMvY >> 1) * iLineSizeUV + (sQpelMvp.iMvX >> 1);
-  pRefCb += iStrideUV;
-  pFunc->sMcFuncs.pMcChromaFunc (pRefCb, iLineSizeUV, pDstCb, 8, sMvp.iMvX, sMvp.iMvY, 8, 8); //Cb
-  iSadCostChroma  = pFunc->sSampleDealingFuncs.pfSampleSad[BLOCK_8x8] (pMbCache->SPicData.pEncMb[1],
-                    pCurLayer->iEncStride[1], pDstCb, 8);
+  if (!pEncCtx->bNeutralChroma) {
+    pRefCb += iStrideUV;
+    pFunc->sMcFuncs.pMcChromaFunc (pRefCb, iLineSizeUV, pDstCb, 8, sMvp.iMvX, sMvp.iMvY, 8, 8); //Cb
+    iSadCostChroma  = pFunc->sSampleDealingFuncs.pfSampleSad[BLOCK_8x8] (pMbCache->SPicData.pEncMb[1],
+                      pCurLayer->iEncStride[1], pDstCb, 8);
 
-  pRefCr += iStrideUV;
-  pFunc->sMcFuncs.pMcChromaFunc (pRefCr, iLineSizeUV, pDstCr, 8, sMvp.iMvX, sMvp.iMvY, 8, 8); //Cr
-  iSadCostChroma += pFunc->sSampleDealingFuncs.pfSampleSad[BLOCK_8x8] (pMbCache->SPicData.pEncMb[2],
-                    pCurLayer->iEncStride[2], pDstCr, 8);
+    pRefCr += iStrideUV;
+    pFunc->sMcFuncs.pMcChromaFunc (pRefCr, iLineSizeUV, pDstCr, 8, sMvp.iMvX, sMvp.iMvY, 8, 8); //Cr
+    iSadCostChroma += pFunc->sSampleDealingFuncs.pfSampleSad[BLOCK_8x8] (pMbCache->SPicData.pEncMb[2],
+                      pCurLayer->iEncStride[2], pDstCr, 8);
+  } else {
+    memset (pDstCb, 128, 128); // Cb and Cr skip predictions are contiguous
+  }
 
   iSadCostMb = iSadCostLuma + iSadCostChroma;
 
@@ -1508,33 +1521,41 @@ bool WelsMdPSkipEnc (sWelsEncCtx* pEncCtx, SWelsMD* pWelsMd, SMB* pCurMb, SMbCac
   WelsDctMb (pMbCache->pCoeffLevel,  pEncMb, iEncStride, pDstLuma, pEncCtx->pFuncList->pfDctFourT4);
 
   if (WelsTryPYskip (pEncCtx, pCurMb, pMbCache)) {
-    iEncStride = pEncCtx->pCurDqLayer->iEncStride[1];
-    pEncMb = pMbCache->SPicData.pEncMb[1];
-    pEncBlockOffset = pStrideEncBlockOffset + 16;
-    pFunc->pfDctFourT4 (pMbCache->pCoeffLevel + 256, & (pEncMb[*pEncBlockOffset]), iEncStride, pMbCache->pSkipMb + 256, 8);
-    if (WelsTryPUVskip (pEncCtx, pCurMb, pMbCache, 1)) {
-      pEncMb = pMbCache->SPicData.pEncMb[2];
-      pEncBlockOffset = pStrideEncBlockOffset + 20;
-      pFunc->pfDctFourT4 (pMbCache->pCoeffLevel + 320, & (pEncMb[*pEncBlockOffset]), iEncStride, pMbCache->pSkipMb + 320, 8);
-      if (WelsTryPUVskip (pEncCtx, pCurMb, pMbCache, 2)) {
-        //update motion info to current MB
-        ST32 (pCurMb->pRefIndex, 0);
-        pFunc->pfUpdateMbMv (pCurMb->sMv, sMvp);
-
-        if (pWelsMd->bMdUsingSad) {
-          pCurMb->pSadCost[0] = iSadCostLuma;
-          pWelsMd->iCostLuma = pCurMb->pSadCost[0];
-        } else
-          pWelsMd->iCostLuma = pFunc->sSampleDealingFuncs.pfSampleSatd[BLOCK_16x16] (pMbCache->SPicData.pEncMb[0],
-                               pCurLayer->iEncStride[0], pDstLuma, 16);
-
-        pWelsMd->iCostSkipMb = iSadCostMb;
-
-        pCurMb->sP16x16Mv = sMvp;
-        pCurLayer->pDecPic->sMvList[pCurMb->iMbXY] = sMvp;
-
-        return true;
+    bool bUVSkip;
+    if (pEncCtx->bNeutralChroma) {
+      memset (pMbCache->pCoeffLevel + 256, 0, 128 * sizeof (int16_t)); // zero chroma residual always skips
+      bUVSkip = true;
+    } else {
+      iEncStride = pEncCtx->pCurDqLayer->iEncStride[1];
+      pEncMb = pMbCache->SPicData.pEncMb[1];
+      pEncBlockOffset = pStrideEncBlockOffset + 16;
+      pFunc->pfDctFourT4 (pMbCache->pCoeffLevel + 256, & (pEncMb[*pEncBlockOffset]), iEncStride, pMbCache->pSkipMb + 256, 8);
+      bUVSkip = WelsTryPUVskip (pEncCtx, pCurMb, pMbCache, 1);
+      if (bUVSkip) {
+        pEncMb = pMbCache->SPicData.pEncMb[2];
+        pEncBlockOffset = pStrideEncBlockOffset + 20;
+        pFunc->pfDctFourT4 (pMbCache->pCoeffLevel + 320, & (pEncMb[*pEncBlockOffset]), iEncStride, pMbCache->pSkipMb + 320, 8);
+        bUVSkip = WelsTryPUVskip (pEncCtx, pCurMb, pMbCache, 2);
       }
+    }
+    if (bUVSkip) {
+      //update motion info to current MB
+      ST32 (pCurMb->pRefIndex, 0);
+      pFunc->pfUpdateMbMv (pCurMb->sMv, sMvp);
+
+      if (pWelsMd->bMdUsingSad) {
+        pCurMb->pSadCost[0] = iSadCostLuma;
+        pWelsMd->iCostLuma = pCurMb->pSadCost[0];
+      } else
+        pWelsMd->iCostLuma = pFunc->sSampleDealingFuncs.pfSampleSatd[BLOCK_16x16] (pMbCache->SPicData.pEncMb[0],
+                             pCurLayer->iEncStride[0], pDstLuma, 16);
+
+      pWelsMd->iCostSkipMb = iSadCostMb;
+
+      pCurMb->sP16x16Mv = sMvp;
+      pCurLayer->pDecPic->sMvList[pCurMb->iMbXY] = sMvp;
+
+      return true;
     }
   }
   return false;
@@ -1613,10 +1634,12 @@ void WelsMdInterMbRefinement (sWelsEncCtx* pEncCtx, SWelsMD* pWelsMd, SMB* pCurM
 
     pWelsMd->iCostSkipMb = pEncCtx->pFuncList->sSampleDealingFuncs.pfSampleSad[BLOCK_16x16] (pMbCache->SPicData.pEncMb[0],
                            pCurDqLayer->iEncStride[0], pDstLuma, 16);
-    pWelsMd->iCostSkipMb += pEncCtx->pFuncList->sSampleDealingFuncs.pfSampleSad[BLOCK_8x8] (pMbCache->SPicData.pEncMb[1],
-                            pCurDqLayer->iEncStride[1], pDstCb, 8);
-    pWelsMd->iCostSkipMb += pEncCtx->pFuncList->sSampleDealingFuncs.pfSampleSad[BLOCK_8x8] (pMbCache->SPicData.pEncMb[2],
-                            pCurDqLayer->iEncStride[2], pDstCr, 8);
+    if (!pEncCtx->bNeutralChroma) {
+      pWelsMd->iCostSkipMb += pEncCtx->pFuncList->sSampleDealingFuncs.pfSampleSad[BLOCK_8x8] (pMbCache->SPicData.pEncMb[1],
+                              pCurDqLayer->iEncStride[1], pDstCb, 8);
+      pWelsMd->iCostSkipMb += pEncCtx->pFuncList->sSampleDealingFuncs.pfSampleSad[BLOCK_8x8] (pMbCache->SPicData.pEncMb[2],
+                              pCurDqLayer->iEncStride[2], pDstCr, 8);
+    }
     break;
 
   case MB_TYPE_16x8:
@@ -1845,7 +1868,8 @@ bool WelsMdFirstIntraMode (sWelsEncCtx* pEncCtx, SWelsMD* pWelsMd, SMB* pCurMb, 
     }
 
     //chroma
-    pWelsMd->iCostChroma = WelsMdIntraChroma (pFunc, pEncCtx->pCurDqLayer, pMbCache, pWelsMd->iLambda);
+    pWelsMd->iCostChroma = WelsMdIntraChroma (pFunc, pEncCtx->pCurDqLayer, pMbCache, pWelsMd->iLambda,
+                                           pEncCtx->bNeutralChroma);
     WelsIMbChromaEncode (pEncCtx, pCurMb, pMbCache);  //add pEnc&rec to MD--2010.3.15
     pCurMb->uiChromPredMode = pMbCache->uiChmaI8x8Mode;
     pCurMb->pSadCost[0] = 0;
@@ -2032,7 +2056,8 @@ void WelsMdIntraSecondaryModesEnc (sWelsEncCtx* pEncCtx, SWelsMD* pWelsMd, SMB* 
   }
 
   //chroma
-  pWelsMd->iCostChroma = WelsMdIntraChroma (pFunc, pEncCtx->pCurDqLayer, pMbCache, pWelsMd->iLambda);
+  pWelsMd->iCostChroma = WelsMdIntraChroma (pFunc, pEncCtx->pCurDqLayer, pMbCache, pWelsMd->iLambda,
+                                         pEncCtx->bNeutralChroma);
   WelsIMbChromaEncode (pEncCtx, pCurMb, pMbCache);  //add pEnc&rec to MD--2010.3.15
   pCurMb->uiChromPredMode = pMbCache->uiChmaI8x8Mode;
   pCurMb->pSadCost[0] = 0;
